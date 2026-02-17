@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import MetaTrader5 as mt5
@@ -21,16 +21,23 @@ class BotConfig:
     ema_fast: int = 20
     ema_mid: int = 50
     ema_slow: int = 200
-    timezone_offset_hours: int = 0  # UTC offset if terminal data is not UTC
     lot_step: float = 0.01
     min_lot: float = 0.01
     max_lot: float = 10.0
     magic: int = 26022026
     deviation: int = 20
     polling_seconds: int = 5
+
+    # Time filter (UTC)
+    enable_session_filter: bool = True
     session_start_utc: int = 13
     session_end_utc: int = 17
-    news_lockout: bool = False  # Hook for your custom news file/API
+
+    # Optional news lockout hook (you can toggle externally)
+    news_lockout: bool = False
+
+    # Diagnostics
+    status_log_seconds: int = 30
 
 
 def connect(cfg: BotConfig) -> None:
@@ -38,6 +45,7 @@ def connect(cfg: BotConfig) -> None:
         raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
     if not mt5.symbol_select(cfg.symbol, True):
         raise RuntimeError(f"Cannot select symbol {cfg.symbol}")
+
 
 
 def get_rates(symbol: str, timeframe: int, bars: int) -> pd.DataFrame:
@@ -49,6 +57,7 @@ def get_rates(symbol: str, timeframe: int, bars: int) -> pd.DataFrame:
     return df
 
 
+
 def add_indicators(df: pd.DataFrame, cfg: BotConfig) -> pd.DataFrame:
     out = df.copy()
     price = out["close"]
@@ -57,8 +66,8 @@ def add_indicators(df: pd.DataFrame, cfg: BotConfig) -> pd.DataFrame:
     out["ema200"] = price.ewm(span=cfg.ema_slow, adjust=False).mean()
 
     hlc3 = (out["high"] + out["low"] + out["close"]) / 3.0
-    pv = hlc3 * out["tick_volume"].replace(0, np.nan)
-    out["vwap"] = pv.cumsum() / out["tick_volume"].replace(0, np.nan).cumsum()
+    vol = out["tick_volume"].replace(0, np.nan)
+    out["vwap"] = (hlc3 * vol).cumsum() / vol.cumsum()
 
     delta = out["close"].diff()
     gain = delta.clip(lower=0)
@@ -81,24 +90,23 @@ def add_indicators(df: pd.DataFrame, cfg: BotConfig) -> pd.DataFrame:
     return out
 
 
+
 def in_session(cfg: BotConfig) -> bool:
+    if not cfg.enable_session_filter:
+        return True
     now = datetime.now(timezone.utc)
     return cfg.session_start_utc <= now.hour < cfg.session_end_utc
 
 
+
 def trend_bias(df5: pd.DataFrame) -> Optional[str]:
     last = df5.iloc[-1]
-    if (
-        last["close"] > last["vwap"]
-        and last["ema20"] > last["ema50"] > last["ema200"]
-    ):
+    if last["close"] > last["vwap"] and last["ema20"] > last["ema50"] > last["ema200"]:
         return "long"
-    if (
-        last["close"] < last["vwap"]
-        and last["ema20"] < last["ema50"] < last["ema200"]
-    ):
+    if last["close"] < last["vwap"] and last["ema20"] < last["ema50"] < last["ema200"]:
         return "short"
     return None
+
 
 
 def has_open_position(symbol: str, magic: int) -> bool:
@@ -108,10 +116,12 @@ def has_open_position(symbol: str, magic: int) -> bool:
     return any(p.magic == magic for p in positions)
 
 
+
 def calc_lot_size(cfg: BotConfig, entry: float, stop: float) -> float:
     info = mt5.account_info()
     if info is None:
         raise RuntimeError("Cannot read account info")
+
     risk_usd = info.balance * cfg.risk_per_trade
     stop_distance = abs(entry - stop)
     if stop_distance <= 0:
@@ -122,6 +132,58 @@ def calc_lot_size(cfg: BotConfig, entry: float, stop: float) -> float:
     lots = max(cfg.min_lot, min(cfg.max_lot, lots))
     lots = round(lots / cfg.lot_step) * cfg.lot_step
     return float(lots)
+
+
+
+def spread_value(symbol: str) -> Optional[float]:
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+    return float(tick.ask - tick.bid)
+
+
+
+def spread_ok(cfg: BotConfig) -> bool:
+    spread = spread_value(cfg.symbol)
+    return spread is not None and spread <= cfg.max_spread_usd
+
+
+
+def entry_signal(df1: pd.DataFrame, bias: str) -> Optional[dict]:
+    # use last CLOSED candle to reduce re-signals on forming candle
+    last = df1.iloc[-2]
+    prev = df1.iloc[-3]
+
+    if bias == "long":
+        cond = (
+            last["close"] > last["ema50"]
+            and abs(last["close"] - last["vwap"]) <= 0.35 * last["atr"]
+            and last["rsi"] > 50
+            and last["close"] > prev["high"]
+        )
+        if cond:
+            stop = min(df1.iloc[-7:-2]["low"].min(), last["close"] - 1.2 * last["atr"])
+            entry = last["close"]
+            risk = entry - stop
+            if risk > 0:
+                return {"side": "long", "entry": entry, "sl": stop, "tp": entry + 1.5 * risk}
+
+    if bias == "short":
+        cond = (
+            last["close"] < last["ema50"]
+            and abs(last["close"] - last["vwap"]) <= 0.35 * last["atr"]
+            and last["rsi"] < 50
+            and last["close"] < prev["low"]
+        )
+        if cond:
+            stop = max(df1.iloc[-7:-2]["high"].max(), last["close"] + 1.2 * last["atr"])
+            entry = last["close"]
+            risk = stop - entry
+            if risk > 0:
+                return {"side": "short", "entry": entry, "sl": stop, "tp": entry - 1.5 * risk}
+
+    return None
+
 
 
 def order_send(cfg: BotConfig, side: str, lot: float, sl: float, tp: float) -> None:
@@ -161,87 +223,66 @@ def order_send(cfg: BotConfig, side: str, lot: float, sl: float, tp: float) -> N
         raise RuntimeError(f"Trade not done. retcode={result.retcode}, comment={result.comment}")
 
 
-def entry_signal(df1: pd.DataFrame, bias: str) -> Optional[dict]:
-    last = df1.iloc[-1]
-    prev = df1.iloc[-2]
 
-    if bias == "long":
-        cond = (
-            last["close"] > last["ema50"]
-            and abs(last["close"] - last["vwap"]) <= 0.35 * last["atr"]
-            and last["rsi"] > 50
-            and last["close"] > prev["high"]
-        )
-        if cond:
-            stop = min(df1.tail(5)["low"].min(), last["close"] - 1.2 * last["atr"])
-            entry = last["close"]
-            risk = entry - stop
-            return {"side": "long", "entry": entry, "sl": stop, "tp": entry + 1.5 * risk}
+def evaluate_once(cfg: BotConfig) -> tuple[bool, str]:
+    if cfg.news_lockout:
+        return False, "news_lockout=True"
 
-    if bias == "short":
-        cond = (
-            last["close"] < last["ema50"]
-            and abs(last["close"] - last["vwap"]) <= 0.35 * last["atr"]
-            and last["rsi"] < 50
-            and last["close"] < prev["low"]
-        )
-        if cond:
-            stop = max(df1.tail(5)["high"].max(), last["close"] + 1.2 * last["atr"])
-            entry = last["close"]
-            risk = stop - entry
-            return {"side": "short", "entry": entry, "sl": stop, "tp": entry - 1.5 * risk}
+    if not in_session(cfg):
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        return False, f"out_of_session (now UTC={now}, window={cfg.session_start_utc:02d}-{cfg.session_end_utc:02d})"
 
-    return None
+    if not spread_ok(cfg):
+        spread = spread_value(cfg.symbol)
+        return False, f"spread_too_wide spread={spread} max={cfg.max_spread_usd}"
 
+    if has_open_position(cfg.symbol, cfg.magic):
+        return False, "existing_position_for_magic"
 
-def spread_ok(cfg: BotConfig) -> bool:
-    t = mt5.symbol_info_tick(cfg.symbol)
-    if t is None:
-        return False
-    spread = t.ask - t.bid
-    return spread <= cfg.max_spread_usd
+    df5 = add_indicators(get_rates(cfg.symbol, mt5.TIMEFRAME_M5, 320), cfg)
+    bias = trend_bias(df5)
+    if not bias:
+        return False, "no_5m_bias"
+
+    df1 = add_indicators(get_rates(cfg.symbol, mt5.TIMEFRAME_M1, 520), cfg)
+    signal = entry_signal(df1, bias)
+    if not signal:
+        return False, f"no_1m_entry (bias={bias})"
+
+    lot = calc_lot_size(cfg, signal["entry"], signal["sl"])
+    if lot < cfg.min_lot:
+        return False, f"lot_below_min lot={lot} min={cfg.min_lot}"
+
+    order_send(cfg, signal["side"], lot, signal["sl"], signal["tp"])
+    return True, (
+        f"ORDER_OPENED side={signal['side']} lot={lot} entry={signal['entry']:.2f} "
+        f"sl={signal['sl']:.2f} tp={signal['tp']:.2f}"
+    )
+
 
 
 def run(cfg: BotConfig) -> None:
     connect(cfg)
+    account = mt5.account_info()
     print("Bot started...")
+    print(
+        f"account={account.login if account else 'unknown'} symbol={cfg.symbol} "
+        f"session_filter={cfg.enable_session_filter} window={cfg.session_start_utc:02d}-{cfg.session_end_utc:02d} UTC"
+    )
+
+    last_status_ts = 0.0
     try:
         while True:
             try:
-                if cfg.news_lockout:
-                    time.sleep(cfg.polling_seconds)
-                    continue
-                if not in_session(cfg):
-                    time.sleep(cfg.polling_seconds)
-                    continue
-                if not spread_ok(cfg):
-                    time.sleep(cfg.polling_seconds)
-                    continue
-                if has_open_position(cfg.symbol, cfg.magic):
-                    time.sleep(cfg.polling_seconds)
-                    continue
-
-                df5 = add_indicators(get_rates(cfg.symbol, mt5.TIMEFRAME_M5, 300), cfg)
-                bias = trend_bias(df5)
-                if not bias:
-                    time.sleep(cfg.polling_seconds)
-                    continue
-
-                df1 = add_indicators(get_rates(cfg.symbol, mt5.TIMEFRAME_M1, 500), cfg)
-                signal = entry_signal(df1, bias)
-                if not signal:
-                    time.sleep(cfg.polling_seconds)
-                    continue
-
-                lot = calc_lot_size(cfg, signal["entry"], signal["sl"])
-                if lot < cfg.min_lot:
-                    time.sleep(cfg.polling_seconds)
-                    continue
-
-                order_send(cfg, signal["side"], lot, signal["sl"], signal["tp"])
-                print(f"{datetime.now()}: Opened {signal['side']} lot={lot} sl={signal['sl']:.2f} tp={signal['tp']:.2f}")
+                opened, reason = evaluate_once(cfg)
+                now_ts = time.time()
+                if opened:
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {reason}")
+                elif now_ts - last_status_ts >= cfg.status_log_seconds:
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] waiting: {reason}")
+                    last_status_ts = now_ts
             except Exception as loop_err:
-                print(f"Loop error: {loop_err}")
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loop error: {loop_err}")
 
             time.sleep(cfg.polling_seconds)
     finally:
@@ -254,5 +295,7 @@ if __name__ == "__main__":
         login=12345678,
         password="YOUR_PASSWORD",
         server="YOUR_BROKER_SERVER",
+        # اگر می‌خواهی 24 ساعته چک کند: enable_session_filter=False
+        # enable_session_filter=False,
     )
     run(cfg)

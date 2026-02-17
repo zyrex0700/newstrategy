@@ -2,6 +2,14 @@
 
 این ربات پایتونی مستقیم به متاتریدر 5 وصل می‌شود، دیتا را از همان MT5 می‌گیرد، و بر اساس نسخه‌ی مکانیکی استراتژی شما برای XAUUSD پوزیشن می‌گیرد.
 
+## چرا فقط `Bot started...` می‌بینی؟
+این یعنی ربات اجرا شده، ولی یکی از فیلترها اجازه‌ی ورود نداده است. در نسخه جدید، هر چند ثانیه دلیل انتظار را چاپ می‌کند:
+- `out_of_session` → خارج از ساعت مجاز
+- `spread_too_wide` → اسپرد زیاد
+- `no_5m_bias` → بایاس 5 دقیقه شکل نگرفته
+- `no_1m_entry` → ستاپ ورود 1 دقیقه هنوز کامل نیست
+- `existing_position_for_magic` → پوزیشن باز قبلی دارید
+
 ## مهم
 - این کد برای آموزش/تست است و سود تضمین نمی‌کند.
 - قبل از حساب واقعی، روی دمو و با لاگ کامل تست کنید.
@@ -33,6 +41,17 @@ cfg = BotConfig(
 python mt5_xau_scalper.py
 ```
 
+## اگر می‌خواهی خارج از سشن هم کار کند
+پیش‌فرض ربات فقط 13 تا 17 UTC فعال است. اگر می‌خواهی همیشه چک کند:
+```python
+cfg = BotConfig(
+    login=12345678,
+    password="YOUR_PASSWORD",
+    server="YOUR_BROKER_SERVER",
+    enable_session_filter=False,
+)
+```
+
 ## منطق اصلی
 - بایاس 5 دقیقه: VWAP + EMA(20/50/200)
 - تریگر 1 دقیقه: پولبک نزدیک VWAP + RSI + شرط کندلی ساده
@@ -46,7 +65,9 @@ python mt5_xau_scalper.py
 پارامترها داخل `BotConfig`:
 - `risk_per_trade`
 - `max_spread_usd`
+- `enable_session_filter`
 - `session_start_utc`, `session_end_utc`
+- `status_log_seconds`
 - `ema_*`, `rsi_period`, `atr_period`
 - `magic`
 
